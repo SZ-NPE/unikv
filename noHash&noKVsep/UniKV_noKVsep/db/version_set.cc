@@ -830,8 +830,8 @@ Status Version::GetKeyinUnsortedStore(const ReadOptions& options,FILE* LogFile[c
   byte* keyBytes=new byte[4];
   unsigned int InKey,hashKey;
   if(strlen(ikey.data())>20){
-      InKey=strtoul((char*)ikey.ToString().substr(4,config::kKeyLength).c_str(),NULL,10);
-      hashKey=verhashfunc.RSHash((char*)ikey.ToString().substr(0,config::kKeyLength).c_str(),config::kKeyLength);
+      InKey=strtoul((char*)ikey.ToString().substr(4,config::kKeyLength).c_str(),NULL,10); // get the key in the internal key
+      hashKey=verhashfunc.RSHash((char*)ikey.ToString().substr(0,config::kKeyLength).c_str(),config::kKeyLength); // get the hash key
       //printf("strlen(ikey.data()):%d,ikey:%s,InKey:%u\n",strlen(ikey.data()),ikey.ToString().substr(0,config::kKeyLength).c_str(),InKey);
   }else{
       InKey=strtoul(ikey.ToString().c_str(),NULL,10);

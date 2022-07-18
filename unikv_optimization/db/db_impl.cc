@@ -264,7 +264,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
   env_->StartThread(&DBImpl::CompactLevelWrapper, this);
 
   num_bg_threads_ = 2;
-  setUpWritePartitionThreads(0);
+  setUpWritePartitionThreads(0); // 启动分区 0 的写线程
   // Reserve ten files or so for other uses and give the rest to TableCache.
   const int table_cache_size = options_.max_open_files - kNumNonTableCacheFiles;
   table_cache_ = new TableCache(dbname_, &options_, table_cache_size);
@@ -2980,11 +2980,12 @@ Status DBImpl::Get(const ReadOptions& options,
   rEntry->RWFlag = 0;
   rEntry->Roptions = options;
   //rEntry->key = key.ToString();
-  strcpy(rEntry->key, key.ToString().c_str());
-  int partition=MapCharKeyToPartition(key);
+  strcpy(rEntry->key, key.ToString().c_str()); // 复制key到rEntry->key中
+  int partition=MapCharKeyToPartition(key); // find the partition of the key
   //fprintf(stderr, "--rEntry.key:%s\n", rEntry->key.c_str());
-  requestBatchQueue[partition].push(rEntry);
-  while(requestBatchQueue[partition].size()>16){//2,4,8,16,1,1000,8
+  requestBatchQueue[partition].push(rEntry); // push the request into the queue
+  // 分区请求队列数量大于阈值，则等待
+  while(requestBatchQueue[partition].size()>16){//2,4,8,16,1,1000,8 // 每个请求队列最多16个请求
     mutex_.Unlock();
     env_->SleepForMicroseconds(1);
     mutex_.Lock();
@@ -3023,11 +3024,11 @@ void DBImpl::PerformGet(ReadOptions& options, char *key, int partition) {
     // First look in the memtable, then in the immutable memtable (if any).
     LookupKey lkey(Slice(key), snapshot);
   
-    if (mem->Get(lkey, &value, &s)) {//
+    if (mem->Get(lkey, &value, &s)) {// 如果在内存中找到，则直接返回
       readMem++;
       double readMemTime=Env::Default()->NowMicros();
       totalReadMem[partition]+=readMemTime-readBeginTime;
-    } else if (imm != NULL && imm->Get(lkey, &value, &s)) {//
+    } else if (imm != NULL && imm->Get(lkey, &value, &s)) {// 如果在immutable中找到，则直接返回
       readImm++;
       double readIemTime=Env::Default()->NowMicros();
       totalReadMem[partition]+=readIemTime-readBeginTime;
@@ -3035,12 +3036,12 @@ void DBImpl::PerformGet(ReadOptions& options, char *key, int partition) {
       int readIn0=0;
       double t=0;
       double beginLevelTime=Env::Default()->NowMicros();
-     #ifdef LIST_HASH_INDEX
+     #ifdef LIST_HASH_INDEX // 如果使用list hash index，则直接从list hash index中找到对应的key，然后从对应的文件中找到对应的value
       int index=partition*config::logFileNum+LogNum[partition]-beginLogNum[partition];
       s = current->Get(options, lkey,dbname_,&value, partition,globalLogFile,beginLogNum,&stats,ListHashIndex[partition],&readDataSizeActual,&readIn0,&tableCacheNum,&blockCacheNum,&t);////////////
 #endif
 
-#ifdef CUCKOO_HASH_INDEX
+#ifdef CUCKOO_HASH_INDEX // 如果使用cuckoo hash index，则直接从cuckoo hash index中找到对应的key，然后从对应的文件中找到对应的value
       int index=partition*config::logFileNum+LogNum[partition]-beginLogNum[partition];
       s = current->GetwithCukoo(options, lkey,dbname_,&value,partition,globalLogFile,beginLogNum,&stats,CuckooHashIndex[partition],&readDataSizeActual,&readIn0,&tableCacheNum,&blockCacheNum,&t);////////////
 #endif
@@ -3659,31 +3660,31 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   
   Status s;
   Slice key, value;
-  updates->GetKeyValue(&key, &value);
-  w.partition=MapCharKeyToPartition(key);
-  s = SequenceWriteBegin(&w, updates);
+  updates->GetKeyValue(&key, &value); // 从 Batch 中读取对应的 kv
+  w.partition=MapCharKeyToPartition(key); // 找到 key 所在的分区
+  s = SequenceWriteBegin(&w, updates); // 开始写入
   //fprintf(stderr,"after SequenceWriteBegin,key:%s,p:%d\n",myKVPair.key.ToString().c_str(),w.partition);
   double logBeginTime=Env::Default()->NowMicros();
   if (s.ok() && updates != NULL) { // NULL batch is for compactions
     double logEndTime=Env::Default()->NowMicros();
 	  totalLogTime[w.partition]+=logEndTime-logBeginTime;
     
-    while(requestBatchQueue[w.partition].size()>1000){//10, 50000
+    while(requestBatchQueue[w.partition].size()>1000){//10, 50000 // 如果请求队列中的请求数量超过1000，则等待
       env_->SleepForMicroseconds(1);//5
     }
 
-    requestEntry *wEntry = new struct requestEntry;
-    while(!finishCompaction){
+    requestEntry *wEntry = new struct requestEntry; // 创建请求项
+    while(!finishCompaction){ // 如果正在进行 compaction，则等待
         env_->SleepForMicroseconds(1);
     }
     
     wEntry->RWFlag = 1;
     wEntry->Woptions = options;
-    updates->GetKeyValueInQueue(&(wEntry->wBatch), treeRoot);
-    WriteBatchInternal::SetSequence(&(wEntry->wBatch), w.start_sequence_);
-    requestBatchQueue[w.partition].push(wEntry);
-    double QueueEndTime=Env::Default()->NowMicros();
-    wCostTimeInQueue[w.partition]+=QueueEndTime-logEndTime;
+    updates->GetKeyValueInQueue(&(wEntry->wBatch), treeRoot); // 从 Batch 中读取对应的 kv，拷贝到请求项 wEntry 中
+    WriteBatchInternal::SetSequence(&(wEntry->wBatch), w.start_sequence_); // 设置序列号
+    requestBatchQueue[w.partition].push(wEntry); // 将请求放入请求队列中（异步）
+    double QueueEndTime=Env::Default()->NowMicros(); // 记录请求队列中的请求结束的时间
+    wCostTimeInQueue[w.partition]+=QueueEndTime-logEndTime; // 记录请求队列中的请求花费的时间
   }
   
   if (!s.ok()) {
@@ -3691,11 +3692,11 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     RecordBackgroundError(s);
     mutex_.Unlock();
   }
-  SequenceWriteEnd(&w);
+  SequenceWriteEnd(&w); // 结束写入
   return s;
 }
 
-void DBImpl::WritePartitionThread(int partition) {
+void DBImpl::WritePartitionThread(int partition) { // 写入线程
   MutexLock l(&mutex_);
   Status s;
   mutex_.Unlock();
@@ -3703,31 +3704,31 @@ void DBImpl::WritePartitionThread(int partition) {
       //if the log of partition is not empty.
       //do while the log is not empty.
       //Get KV pairs from it's log and write to this partition in background
-      while(!requestBatchQueue[partition].empty()){
+      while(!requestBatchQueue[partition].empty()){ // 如果请求队列中的请求不为空，则继续读取请求队列中的请求
 
-          struct requestEntry *curEntry = requestBatchQueue[partition].front();
+          struct requestEntry *curEntry = requestBatchQueue[partition].front(); // 获取请求队列中的第一个请求项
           //fprintf(stderr,"-partition:%d, queue size:%d!\n",partition, requestQueue[partition].size());
-          if(curEntry->RWFlag==1){           
+          if(curEntry->RWFlag==1){  // 如果是写请求，则进行写入操作         
             mutex_.Lock();
-              double logBeginTime=Env::Default()->NowMicros();
-              Status s = log_[partition]->AddRecord(WriteBatchInternal::Contents(&(curEntry->wBatch)));
+              double logBeginTime=Env::Default()->NowMicros(); // 记录写入开始的时间
+              Status s = log_[partition]->AddRecord(WriteBatchInternal::Contents(&(curEntry->wBatch))); // 写入日志
               //fprintf(stderr,"after AddRecord,key:%s,p:%d\n",key.ToString().c_str(),partition);
-              if (s.ok() && curEntry->Woptions.sync) {
+              if (s.ok() && curEntry->Woptions.sync) { // 如果是同步写入，则进行同步写入操作
                 s = logfile_[partition]->Sync();
               }
-              double logEndTime=Env::Default()->NowMicros();
-	            totalLogTime[partition]+=logEndTime-logBeginTime;
+              double logEndTime=Env::Default()->NowMicros(); // 记录写入结束的时间
+	            totalLogTime[partition]+=logEndTime-logBeginTime; //  
             mutex_.Unlock();
-              double memBeginTime=Env::Default()->NowMicros();
-              s = WriteBatchInternal::InsertInto(&(curEntry->wBatch), pmem_);
+              double memBeginTime=Env::Default()->NowMicros(); // 记录 mem 写入时间
+              s = WriteBatchInternal::InsertInto(&(curEntry->wBatch), pmem_); // 写入 mem
               double MemEndTime=Env::Default()->NowMicros();
               totalMemTableTime[partition]+=MemEndTime-memBeginTime;
           }else{
               //fprintf(stderr,"key:%s\n", (*curEntry).key.c_str());
-              PerformGet(curEntry->Roptions, curEntry->key, partition);
+              PerformGet(curEntry->Roptions, curEntry->key, partition); // 如果是读请求，则进行读取操作
           }
           //fprintf(stderr,"--partition:%d, after insert MemTable!\n", partition);
-          requestBatchQueue[partition].pop();
+          requestBatchQueue[partition].pop(); // 将请求项从请求队列中删除
           delete curEntry;                     
       }
       
@@ -3746,20 +3747,20 @@ Status DBImpl::SequenceWriteBegin(Writer* w, WriteBatch* updates) {
     straight_reads_ = 0;
     bool force = updates == NULL;
     bool enqueue_mem = false;
-    w->micros_ = versions_->NumLevelFiles(0,w->partition);
+    w->micros_ = versions_->NumLevelFiles(0,w->partition); // 获取该分区 unsorted 的文件数量
     while (true) {
       if (!bg_error_.ok()) {
         // Yield previous error
         s = bg_error_;
         break;
       } else if (!force && finishCompaction && versions_->NumLevelFiles(0,w->partition)<config::kL0_StopWritesTrigger &&
-                 (pmem_[w->partition]->ApproximateMemoryUsage() <= options_.write_buffer_size)) {
+                 (pmem_[w->partition]->ApproximateMemoryUsage() <= options_.write_buffer_size)) { // 如果没有开启 compaction，并且当前分区的 unsorted 文件数量小于阈值，并且当前分区的 pmem 的内存使用量小于阈值，则直接写入
                    //&& partitonUnsortedBuffered[w->partition]<config::kL0_CompactionTrigger
         // There is room in current memtable
         // Note that this is a sloppy check.  We can overfill a memtable by the
         // amount of concurrently written data.
         break;
-      } else if (pimm_[w->partition] != NULL) {
+      } else if (pimm_[w->partition] != NULL) { // 如果该分区的 imm 不为空，则等待 imm 的写入完成
         // We have filled up the current memtable, but the previous
         // one is still being compacted, so we wait.
 	      //fprintf(stderr,"in SequenceWriteBegin bg_fg_cv_.Wait()\n");
@@ -3767,13 +3768,13 @@ Status DBImpl::SequenceWriteBegin(Writer* w, WriteBatch* updates) {
         //bg_compaction_cv_.Wait();
         bg_fg_cv_.Wait();
         
-      }else if(pmem_[w->partition]->ApproximateMemoryUsage() > options_.write_buffer_size){
+      }else if(pmem_[w->partition]->ApproximateMemoryUsage() > options_.write_buffer_size){ // 如果该分区的 memtable 超过了写缓冲区的大小
         // Attempt to switch to a new memtable and trigger compaction of old
 	      //fprintf(stderr,"build new MemTable, w->partition:%d\n", w->partition);
         //assert(versions_->PrevLogNumber(w->partition) == 0);
-        uint64_t new_log_number = versions_->NewFileNumber();
+        uint64_t new_log_number = versions_->NewFileNumber(); // 获取新的日志文件号
         ConcurrentWritableFile* lfile = NULL;
-        s = env_->NewConcurrentWritableFile(LogFileName(dbname_, new_log_number), &lfile);
+        s = env_->NewConcurrentWritableFile(LogFileName(dbname_, new_log_number), &lfile); // 创建新的日志文件
         if (!s.ok()) {
           // Avoid chewing through file number space in a tight loop.
           versions_->ReuseFileNumber(new_log_number);
@@ -3781,41 +3782,41 @@ Status DBImpl::SequenceWriteBegin(Writer* w, WriteBatch* updates) {
         }
 
         for(int k=0;k<logNumVec.size();k++){
-          if(logNumVec[k]==logfile_number_[w->partition]){
-              logNumVec.erase(logNumVec.begin()+k);
-              k--;
+          if(logNumVec[k]==logfile_number_[w->partition]){ // 如果该分区的日志文件号已经存在于 logNumVec，则将其删除
+              logNumVec.erase(logNumVec.begin()+k); // 删除该分区的日志文件号
+              k--; // 因为删除了一个元素，所以要减一
           }
 	       }
-        logImNumVec.push_back(logfile_number_[w->partition]);
-        logfileImm_number_[w->partition]=logfile_number_[w->partition];
-        logfile_[w->partition].reset(lfile);
-        logfile_number_[w->partition]= new_log_number;	  
-	      logNumVec.push_back(new_log_number);
+        logImNumVec.push_back(logfile_number_[w->partition]); // 将该分区的日志文件号添加到 logImNumVec 中
+        logfileImm_number_[w->partition]=logfile_number_[w->partition]; // 将该分区的日志文件号设置为 logfile_number_[w->partition] 
+        logfile_[w->partition].reset(lfile); // 将该分区的日志文件设置为 lfile，即新创建的日志
+        logfile_number_[w->partition]= new_log_number;	  // 将该分区的日志文件号设置为 new_log_number
+	      logNumVec.push_back(new_log_number); // 插入新的日志号到 logNumVec
        // logfile_number_ = new_log_number;
-        log_[w->partition].reset(new log::Writer(lfile));
+        log_[w->partition].reset(new log::Writer(lfile));  // 重置对应的 writer 位新的日志对应的 writer
 
-        pimm_[w->partition] = pmem_[w->partition];
-        w->has_imm_= true;
-        pmem_[w->partition] = new MemTable(internal_comparator_);
-        pmem_[w->partition]->Ref();
-        flushedMemTable[w->partition] = false;
-        bg_memtable_cv_.Signal();///////////
+        pimm_[w->partition] = pmem_[w->partition]; // 将该分区的 memtable 设置为 imm 中的 memtable
+        w->has_imm_= true; // 设置该分区的 has_imm_ 为 true
+        pmem_[w->partition] = new MemTable(internal_comparator_); // 创建新的 memtable
+        pmem_[w->partition]->Ref(); // 增加引用计数
+        flushedMemTable[w->partition] = false; // 将该分区的 flushedMemTable 设置为 false
+        bg_memtable_cv_.Signal();/////////// 唤醒写入文件线程
         force = false; //Do not force another compaction if have room
-        enqueue_mem = true;
+        enqueue_mem = true; // 将该分区的 enqueue_mem 设置为 true
         break;
       }else{       
-        bg_fg_cv_.Wait();
+        bg_fg_cv_.Wait(); // 等待写入完成
       }
     }
 
-    if (s.ok()) {
+    if (s.ok()) { // 如果没有错误，则将该分区的 memtable 写入 writer 中
       w->log_[w->partition] = log_[w->partition];
       w->logfile_[w->partition] = logfile_[w->partition];
       w->mem_[w->partition] = pmem_[w->partition];
       pmem_[w->partition]->Ref();
     }
 
-    if (enqueue_mem) {
+    if (enqueue_mem) { // 如果 enqueue_mem 为 true，则将该分区的 memtable 加入到 memtable_queue_ 中
       for (std::list<ReplayIteratorImpl*>::iterator it = replay_iters_.begin();
           it != replay_iters_.end(); ++it) {
         (*it)->enqueue(pmem_[w->partition], w->start_sequence_);
@@ -3823,21 +3824,21 @@ Status DBImpl::SequenceWriteBegin(Writer* w, WriteBatch* updates) {
     }
   }
 
-  if (s.ok()) {
-    uint64_t diff = updates ? WriteBatchInternal::Count(updates) : 0;
+  if (s.ok()) { 
+    uint64_t diff = updates ? WriteBatchInternal::Count(updates) : 0; // 计算 updates 中的条数
     uint64_t ticket = 0;
     w->linked_ = true;
     w->next_ = NULL;
 
     //writers_mutex_.Lock();
-    if (writers_tail_) {
+    if (writers_tail_) { // 如果 writers_tail_ 不为空，则将该 writer 添加到 writers_tail_ 的后面
       writers_tail_->next_ = w;
       w->prev_ = writers_tail_;
     }
     writers_tail_ = w;
-    ticket = __sync_add_and_fetch(&writers_upper_, 1 + diff);
+    ticket = __sync_add_and_fetch(&writers_upper_, 1 + diff); // 将 writers_upper_ 增加 diff 条数
     while (w->block_if_backup_in_progress_ &&
-           backup_in_progress_.Acquire_Load()) {
+           backup_in_progress_.Acquire_Load()) { // 如果该 writer 要求 block_if_backup_in_progress_ 且 backup_in_progress_ 为 true，则 block_if_backup_in_progress_ 为 true
       w->wake_me_when_head_ = true;
       w->cv_.Wait();
       w->wake_me_when_head_ = false;
@@ -4220,7 +4221,7 @@ Status DB::Open(const Options& options, const std::string& dbname,
 
   ConcurrentWritableFile* lfile[config::kNumPartition]={NULL};
 
-for(int i=1;i<=impl->NewestPartition;i++){
+for(int i=1;i<=impl->NewestPartition;i++){ // 多少个分区启动多少个线程
     impl->setUpWritePartitionThreads(i);//////
 }
 
